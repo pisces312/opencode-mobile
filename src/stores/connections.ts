@@ -120,32 +120,20 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
       // Find active connection
       const active = connections.find((c) => c.active) || null
 
-      // Create client for active connection
+      // Build the client from local data only and release the loading gate
+      // immediately. A recorded transport (active.api) is reused as-is; an
+      // unrecorded one defaults to v2 here and is corrected by the background
+      // probe below. Nothing on this path touches the network, so an
+      // unreachable server can no longer hold the full-screen spinner.
       let client: Client | null = null
       let base: ClientBase | null = null
-      let project: Project | null = null
-      let home: string | null = null
+      let auth: { username: string; password: string } | undefined
       if (active) {
         const password = await SecureStore.getItemAsync(`${PASSWORDS_PREFIX}${active.id}`)
-        const auth = buildAuth(active.username, password)
-        const { api, resolved } = await resolveApi(active, auth)
-        const built = buildClient(active.url, active.directory, auth, api)
+        auth = buildAuth(active.username, password)
+        const built = buildClient(active.url, active.directory, auth, active.api)
         client = built.client
         base = built.base
-        // Persist a probe that was only just discovered, so the next launch
-        // picks the same transport without probing again.
-        if (resolved) await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
-        // Fetch current project info and server paths
-        try {
-          const [proj, paths] = await Promise.all([
-            client.project.current().catch(() => null),
-            client.path.get().catch(() => null),
-          ])
-          project = proj
-          home = paths?.home || null
-        } catch {
-          // Server might be offline
-        }
       }
 
       set({
@@ -153,11 +141,39 @@ export const useConnections = create<ConnectionsState>((set, get) => ({
         activeConnection: active,
         client,
         clientBase: base,
-        currentProject: project,
-        serverHome: home,
+        currentProject: null,
+        serverHome: null,
         recentDirectories,
         isLoading: false,
       })
+
+      // Resolve transport + fetch project metadata off the critical path. The
+      // home screen renders its own error/retry state when these fail, so a
+      // dead server degrades gracefully instead of blocking startup.
+      if (active && client) {
+        const activeId = active.id
+        const stillActive = () => get().activeConnection?.id === activeId
+        void (async () => {
+          const { api, resolved } = await resolveApi(active, auth)
+          if (!stillActive()) return
+          if (resolved) {
+            const built = buildClient(active.url, active.directory, auth, api)
+            client = built.client
+            base = built.base
+            // Persist a probe that was only just discovered, so the next launch
+            // picks the same transport without probing again.
+            await SecureStore.setItemAsync(CONNECTIONS_KEY, JSON.stringify(connections))
+            if (!stillActive()) return
+            set({ client, clientBase: base })
+          }
+          const [proj, paths] = await Promise.all([
+            client!.project.current().catch(() => null),
+            client!.path.get().catch(() => null),
+          ])
+          if (!stillActive()) return
+          set({ currentProject: proj, serverHome: paths?.home || null })
+        })()
+      }
     } catch (error) {
       set({ error: "Failed to load connections", isLoading: false })
     }
